@@ -4,16 +4,24 @@
 #  - 参加最大24人までのチーム自動編成（2 / 3 / 4チーム）
 #  - 一括入力（「名前：レート, 名前：レート, ...」）対応
 #  - 参加チェック・個別入力・結果表示・勝利チームのレート更新
+#  - ★編成結果をPNG画像でダウンロード（Pillow使用）
 #
 # ファイル名の想定: mkwab.py
 # ※本ツールは非公式のファンメイドです。任天堂・各権利者とは一切関係ありません。
 
 import re
-import itertools
+import io
 from typing import List, Tuple, Dict, Any
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
+# Pillow (画像出力) は任意機能
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 st.set_page_config(page_title="mkwab – マリオカートワールド オートバランス", layout="wide")
 
@@ -51,11 +59,17 @@ if "team_check_4" not in st.session_state:
 if "assigned_results" not in st.session_state:
     st.session_state.assigned_results = {}
 
-st.title("🏎️ mkwab – マリオカートワールド オートバランス by あすとらふぃーだ")
+# =========================
+# タイトル（by あすとらふぃーだ 部分をXにリンク）
+# =========================
+st.markdown(
+    "## 🏎️ mkwab – マリオカートワールド オートバランス by "
+    "[あすとらふぃーだ](https://x.com/Ascalaphidae)"
+)
 
 st.markdown("""
 マリオカートワールドの **レート** に応じて **2 / 3 / 4チーム** の最適化を試みた編成を行い、  
-勝利チームの **レート更新** までワンストップで行えます ✨
+勝利チームの **レート更新** と **編成結果のPNG保存** までワンストップで行えます ✨
 
 > **注意:** 本アプリは非公式のファンメイドツールです。各権利者とは関係ありません。
 ---
@@ -65,12 +79,12 @@ st.markdown("""
 # ① 一括入力 UI
 # =========================
 st.subheader("🧩 一括入力（プレイヤー名とレート）")
-st.caption("例： あすふぃだ：2400, イシガケ：2000, ウスバキ：1800（全角/半角の「：」「,」「、」「；」「;」、改行OK）")
+st.caption("例： あすふぃだ：7000、イシガケ：7100、ウスバキ：6900、エサキモンツノ：7200（全角/半角の「：」「,」「、」「；」「;」、改行OK）")
 st.session_state.bulk_input = st.text_area(
     "形式：名前：レート をカンマ等で区切って入力（最大24人まで）",
     value=st.session_state.bulk_input,
     height=100,
-    placeholder="あすふぃだ：2400, イシガケ：2000, ウスバキ：1800"
+    placeholder="あすふぃだ：7000、イシガケ：7100、ウスバキ：6900、エサキモンツノ：7200"
 )
 
 def _parse_and_apply_bulk():
@@ -218,10 +232,8 @@ def assign_k_teams_greedy(players_list: List[Tuple[str, int]], k: int):
 
     # 貪欲割当
     for p in players_sorted:
-        # 入れられるチームの中で合計レートが最小の所へ
         candidates = [(i, sums[i]) for i in range(k) if len(teams[i]) < sizes[i]]
         if not candidates:
-            # 念のため（理論上は起きない想定）
             candidates = [(i, len(teams[i])) for i in range(k)]
         target_idx = min(candidates, key=lambda x: x[1])[0]
         teams[target_idx].append(p)
@@ -236,16 +248,13 @@ def assign_k_teams_greedy(players_list: List[Tuple[str, int]], k: int):
     while improved and tries < 200:
         improved = False
         tries += 1
-        # すべてのペアチーム間でスワップを試す
         for a in range(k):
             for b in range(a+1, k):
-                # サイズは既に適正なので、1対1スワップのみ試す
                 best_local_gain = 0
                 best_pair = None
                 base_diff = current_diff(sums)
                 for i, pa in enumerate(teams[a]):
                     for j, pb in enumerate(teams[b]):
-                        # スワップ後の合計
                         new_sa = sums[a] - pa[1] + pb[1]
                         new_sb = sums[b] - pb[1] + pa[1]
                         new_sums = sums.copy()
@@ -258,7 +267,6 @@ def assign_k_teams_greedy(players_list: List[Tuple[str, int]], k: int):
                             best_pair = (i, j, new_sums)
                 if best_pair:
                     i, j, new_sums = best_pair
-                    # スワップ実行
                     pa = teams[a][i]
                     pb = teams[b][j]
                     teams[a][i], teams[b][j] = pb, pa
@@ -269,10 +277,9 @@ def assign_k_teams_greedy(players_list: List[Tuple[str, int]], k: int):
     return teams, diff
 
 # =========================
-# チーム編成 実行
+# チーム編成 実行（より堅牢に：stageだけで判定）
 # =========================
 def _run_assignment():
-    # 「参加ON」かつ「名前が非空」だけを抽出
     selected = [
         (n, r)
         for (n, r), use in zip(st.session_state.players, st.session_state.participate)
@@ -280,7 +287,6 @@ def _run_assignment():
     ]
     n_sel = len(selected)
 
-    # 上限チェック（24人）
     if n_sel > 24:
         st.session_state.stage = "start"
         st.session_state.assigned_results = {}
@@ -291,7 +297,6 @@ def _run_assignment():
         st.warning("⚠️ 2人以上選んでください。（名前が空欄だと無視されます）")
         return
 
-    # どのチーム数を使うか（未チェックなら 2チームにフォールバック）
     selected_k_list = []
     if st.session_state.team_check_2:
         selected_k_list.append(2)
@@ -317,7 +322,7 @@ def _run_assignment():
     else:
         st.info("（条件を満たすチーム数が選択されていないため、編成は行われませんでした）")
 
-if st.session_state.get("stage") == "assigned" and submit:
+if st.session_state.get("stage") == "assigned":
     _run_assignment()
 
 # =========================
@@ -345,14 +350,96 @@ if img_url:
     """, height=260)
 
 # =========================
-# チーム表示 & レート更新
-# （2/3/4 それぞれ独立して更新可能）
+# 画像保存（PNG）用ヘルパー
+# =========================
+def _load_jp_font(size: int):
+    """日本語対応フォントを探索して読み込み（見つからなければデフォルト）"""
+    candidates = [
+        "./NotoSansJP-Regular.ttf",
+        "C:/Windows/Fonts/meiryo.ttc",
+        "C:/Windows/Fonts/YuGothM.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansJP-Regular.ttf",
+        "/System/Library/Fonts/Hiragino Sans W3.ttc",
+        "/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/Library/Fonts/Hiragino Sans W3.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+    ]
+    if not PIL_AVAILABLE:
+        return None
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+def _render_teams_png(teams: List[List[Tuple[str, int]]], labels: List[str], totals: List[int], diff: int) -> bytes:
+    """編成結果をPNG画像に描画してbytesで返す（Pillow）。"""
+    if not PIL_AVAILABLE:
+        return b""
+
+    k = len(teams)
+    pad = 40
+    gap = 24
+    col_w = 460
+    row_h = 38
+    title_h = 58
+    sub_h = 28
+    head_h = 40
+
+    max_rows = max((len(t) for t in teams), default=0)
+    width = pad * 2 + k * col_w + (k - 1) * gap
+    height = pad * 2 + title_h + sub_h + head_h + (max_rows + 1) * row_h
+
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    font_title = _load_jp_font(28)
+    font_sub = _load_jp_font(16)
+    font_head = _load_jp_font(20)
+    font_row = _load_jp_font(18)
+
+    # タイトル
+    title = "mkwab – マリオカートワールド オートバランス"
+    draw.text((pad, pad), title, fill=(0, 0, 0), font=font_title)
+    # サブ（差分）
+    sub = f"合計レート差: {diff}"
+    draw.text((pad, pad + title_h - 10), sub, fill=(80, 80, 80), font=font_sub)
+
+    # 各カラム
+    base_x = pad
+    base_y = pad + title_h + sub_h
+
+    for ci in range(k):
+        x = base_x + ci * (col_w + gap)
+        # ヘッダ
+        head_text = f"チーム{labels[ci]}（合計: {totals[ci]}）"
+        draw.rectangle([(x, base_y), (x + col_w, base_y + head_h)], fill=(245, 245, 245))
+        draw.text((x + 12, base_y + 8), head_text, fill=(0, 0, 0), font=font_head)
+
+        # 行
+        y = base_y + head_h + 6
+        for ri, (name, rate) in enumerate(teams[ci]):
+            line = f"{ri+1:>2}. {name}    {rate}"
+            draw.text((x + 12, y), line, fill=(0, 0, 0), font=font_row)
+            y += row_h
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+# =========================
+# チーム表示 & レート更新 & PNG保存
 # =========================
 if st.session_state.assigned_results:
     st.divider()
-    st.header("📊 編成結果 & レート更新")
+    st.header("📊 編成結果 & レート更新 / 画像保存")
 
-    # チームラベル（A/B/C/D）を用意
     def _team_label(idx: int) -> str:
         return ["A", "B", "C", "D"][idx]
 
@@ -363,7 +450,6 @@ if st.session_state.assigned_results:
 
         st.subheader(f"🧩 {k}チーム編成  （合計レート差: {diff}）")
 
-        # チーム表示（k列）
         team_cols = st.columns(k)
         team_totals = []
         for ti in range(k):
@@ -376,11 +462,9 @@ if st.session_state.assigned_results:
                 team_totals.append(total)
                 st.markdown(f"**合計パワー：{total}**")
 
-        # 勝利チームのレート更新（この編成に対して独立に行う）
         st.markdown("---")
         st.markdown(f"#### 🏆 勝利チームのレート更新（{k}チーム編成 用）")
 
-        # ラジオ（A..）と倍率
         win_team = st.radio(
             f"どのチームが勝ちましたか？（{k}チーム編成）",
             [_team_label(i) for i in range(k)],
@@ -418,8 +502,11 @@ if st.session_state.assigned_results:
                     updated_players.append((n, r))
 
             st.session_state.players = updated_players
+            # 最新レートで再編成して表示を同期
+            st.session_state.stage = "assigned"
+            st.session_state.assigned_results = {}
+            _run_assignment()
             st.success(f"✅ レートを更新しました！（{_k}チーム編成／勝利: { _winner_label }／倍率: { _mult }）")
-            st.rerun()
 
         st.button(
             f"📈 レートを更新する（{k}チーム編成）",
@@ -428,5 +515,20 @@ if st.session_state.assigned_results:
             args=(k, win_team, multiplier)
         )
 
+        # --- PNG保存（Pillow使用） ---
+        st.markdown("#### 🖼️ 編成結果の画像保存（PNG）")
+        if PIL_AVAILABLE:
+            labels = [_team_label(i) for i in range(k)]
+            png_bytes = _render_teams_png(teams, labels, team_totals, diff)
+            st.download_button(
+                label=f"🖼️ PNGをダウンロード（{k}チーム編成）",
+                data=png_bytes,
+                file_name=f"mkwab_{k}teams.png",
+                mime="image/png",
+                key=f"dl_png_k{k}"
+            )
+            st.caption("※ 日本語フォントが見つからない環境では文字化けする場合があります。必要なら `NotoSansJP-Regular.ttf` を同じフォルダに置いてください。")
+        else:
+            st.info("画像保存機能を使うには、`pip install pillow` を実行してください。")
 else:
     st.info("まだ編成結果はありません。「✅ チームを分ける」を押して編成を実行してください。")
